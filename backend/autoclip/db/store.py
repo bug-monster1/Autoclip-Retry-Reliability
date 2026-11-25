@@ -391,3 +391,93 @@ def list_exports(clip_id: str) -> list[Export]:
             "SELECT * FROM exports WHERE clip_id = ? ORDER BY created_at DESC", (clip_id,)
         ).fetchall()
     return [Export.from_row(r) for r in rows]
+
+
+def publish_pipeline_exports(
+    job_id: str,
+    clips: list[Clip],
+    exports: list[Export],
+    *,
+    replace_candidates: bool = False,
+) -> list[str]:
+    """Publish one complete pipeline result in a single transaction.
+
+    Rendering happens before this call.  The atomic swap prevents a failed
+    retry from exposing a mixture of exports from two processing attempts.
+    Returned paths belong to superseded records and can be removed afterwards.
+    """
+    clip_ids = [clip.id for clip in clips]
+    if not clip_ids and not replace_candidates:
+        return []
+
+    placeholders = ", ".join("?" for _ in clip_ids)
+    with connection() as conn:
+        if replace_candidates:
+            rows = conn.execute(
+                """
+                SELECT exports.path
+                FROM exports
+                JOIN clips ON clips.id = exports.clip_id
+                WHERE clips.job_id = ?
+                """,
+                (job_id,),
+            ).fetchall()
+            old_paths = [row["path"] for row in rows]
+            conn.execute("DELETE FROM clips WHERE job_id = ?", (job_id,))
+            conn.executemany(
+                """
+                INSERT INTO clips (id, job_id, rank, start_s, end_s, start_word, end_word,
+                                   title, hook, score, reason, status, user_trimmed, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        clip.id,
+                        clip.job_id,
+                        clip.rank,
+                        clip.start_s,
+                        clip.end_s,
+                        clip.start_word,
+                        clip.end_word,
+                        clip.title,
+                        clip.hook,
+                        clip.score,
+                        clip.reason,
+                        "exported",
+                        int(clip.user_trimmed),
+                        clip.created_at,
+                    )
+                    for clip in clips
+                ],
+            )
+        elif clip_ids:
+            rows = conn.execute(
+                f"SELECT path FROM exports WHERE clip_id IN ({placeholders})", clip_ids
+            ).fetchall()
+            old_paths = [row["path"] for row in rows]
+            conn.execute(f"DELETE FROM exports WHERE clip_id IN ({placeholders})", clip_ids)
+
+        if clip_ids:
+            conn.executemany(
+                """
+                INSERT INTO exports (id, clip_id, path, ratio, style, size_bytes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record.id,
+                        record.clip_id,
+                        record.path,
+                        record.ratio,
+                        record.style,
+                        record.size_bytes,
+                        record.created_at,
+                    )
+                    for record in exports
+                ],
+            )
+            conn.execute(
+                f"UPDATE clips SET status = 'exported' WHERE id IN ({placeholders})", clip_ids
+            )
+
+    return old_paths

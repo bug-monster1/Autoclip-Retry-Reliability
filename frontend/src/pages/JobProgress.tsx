@@ -18,8 +18,9 @@ const STAGES = [
 export function JobProgress() {
   const { jobId } = useParams()
   const navigate = useNavigate()
-  const { job, progress } = useJobStream(jobId)
+  const { job, progress, setJob, reconnect } = useJobStream(jobId)
   const [cancelling, setCancelling] = useState(false)
+  const [retrying, setRetrying] = useState(false)
   const [actionError, setActionError] = useState<Error | null>(null)
 
   useEffect(() => {
@@ -50,12 +51,16 @@ export function JobProgress() {
   }
 
   const retry = async () => {
+    setRetrying(true)
     setActionError(null)
     try {
-      await api.retryJob(job.id)
-      window.location.reload()
+      const queued = await api.retryJob(job.id)
+      setJob({ ...queued, source: queued.source ?? job.source })
+      reconnect()
     } catch (err) {
       setActionError(err as Error)
+    } finally {
+      setRetrying(false)
     }
   }
 
@@ -87,8 +92,8 @@ export function JobProgress() {
             </button>
           )}
           {(job.status === 'failed' || job.status === 'cancelled') && (
-            <button onClick={retry} className="btn btn-primary">
-              Retry
+            <button onClick={retry} disabled={retrying} className="btn btn-primary">
+              {retrying ? 'Retrying…' : 'Retry'}
             </button>
           )}
           {job.status === 'done' && (
@@ -103,7 +108,7 @@ export function JobProgress() {
         <div className="mt-8 max-w-3xl">
           <ErrorNote error={new Error(job.error)} />
           <p className="mt-3 text-xs text-ink-500">
-            Retrying resumes from the stage that failed — finished stages are not redone.
+            Retrying starts at the failed stage and rebuilds everything after it.
           </p>
         </div>
       )}

@@ -275,3 +275,48 @@ class TestTranscriptsEditsAndExports:
         store.create_export(Export(id=new_id(), clip_id=clip.id, path="out_1x1.mp4", ratio="1:1"))
 
         assert len(store.list_exports(clip.id)) == 2
+
+    def test_pipeline_exports_are_replaced_as_one_complete_set(self, job: Job) -> None:
+        clips = [
+            Clip(id=new_id(), job_id=job.id, rank=rank, start_s=rank, end_s=rank + 10)
+            for rank in (1, 2)
+        ]
+        store.replace_clips(job.id, clips)
+        for clip in clips:
+            store.create_export(Export(id=new_id(), clip_id=clip.id, path=f"old-{clip.rank}"))
+
+        replacements = [
+            Export(id=new_id(), clip_id=clip.id, path=f"new-{clip.rank}") for clip in clips
+        ]
+        old_paths = store.publish_pipeline_exports(job.id, clips, replacements)
+
+        assert set(old_paths) == {"old-1", "old-2"}
+        assert [store.list_exports(clip.id)[0].path for clip in clips] == ["new-1", "new-2"]
+        assert all(store.get_clip(clip.id).status == "exported" for clip in clips)
+
+    def test_candidate_swap_removes_stale_downstream_rows_only_at_publish(self, job: Job) -> None:
+        old_clip = Clip(id=new_id(), job_id=job.id, start_s=0, end_s=10)
+        store.replace_clips(job.id, [old_clip])
+        store.create_export(Export(id=new_id(), clip_id=old_clip.id, path="old.mp4"))
+        new_clip = Clip(id=new_id(), job_id=job.id, start_s=20, end_s=30)
+        new_export = Export(id=new_id(), clip_id=new_clip.id, path="new.mp4")
+
+        # Detection and rendering can finish while the previous result remains readable.
+        assert store.list_exports(old_clip.id)[0].path == "old.mp4"
+        old_paths = store.publish_pipeline_exports(
+            job.id, [new_clip], [new_export], replace_candidates=True
+        )
+
+        assert old_paths == ["old.mp4"]
+        assert store.get_clip(old_clip.id) is None
+        assert store.list_exports(new_clip.id)[0].path == "new.mp4"
+
+    def test_empty_candidate_swap_does_not_keep_stale_output(self, job: Job) -> None:
+        old_clip = Clip(id=new_id(), job_id=job.id, start_s=0, end_s=10)
+        store.replace_clips(job.id, [old_clip])
+        store.create_export(Export(id=new_id(), clip_id=old_clip.id, path="old.mp4"))
+
+        old_paths = store.publish_pipeline_exports(job.id, [], [], replace_candidates=True)
+
+        assert old_paths == ["old.mp4"]
+        assert store.list_clips(job.id) == []

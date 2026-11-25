@@ -21,6 +21,7 @@ export function useJobStream(jobId: string | undefined) {
   const [job, setJob] = useState<Job | null>(null)
   const [progress, setProgress] = useState<StageProgress | null>(null)
   const [connected, setConnected] = useState(false)
+  const [connectionAttempt, setConnectionAttempt] = useState(0)
   const sourceRef = useRef<EventSource | null>(null)
 
   useEffect(() => {
@@ -49,7 +50,9 @@ export function useJobStream(jobId: string | undefined) {
 
     source.addEventListener('snapshot', (event) => {
       const data = JSON.parse((event as MessageEvent).data) as Job
-      setJob(data)
+      // SSE snapshots intentionally carry only job state. Preserve the source
+      // metadata fetched by getJob so retrying does not make the title vanish.
+      setJob((current) => ({ ...data, source: data.source ?? current?.source ?? null }))
       if (['done', 'failed', 'cancelled'].includes(data.status)) close()
     })
 
@@ -89,7 +92,12 @@ export function useJobStream(jobId: string | undefined) {
       source.close()
       sourceRef.current = null
     }
-  }, [jobId])
+  }, [jobId, connectionAttempt])
 
-  return { job, progress, connected, setJob }
+  const reconnect = () => {
+    setProgress(null)
+    setConnectionAttempt((attempt) => attempt + 1)
+  }
+
+  return { job, progress, connected, setJob, reconnect }
 }

@@ -13,6 +13,8 @@ from ..db import store
 from ..db.models import Job, new_id
 from ..jobs.events import broker
 from ..jobs.queue import queue
+from ..pipeline import STAGES, Stage
+from ..pipeline.runner import STAGE_WEIGHTS, JobWorkspace
 from .schemas import JobCreateIn, JobOut, JobSettingsIn
 
 log = logging.getLogger(__name__)
@@ -147,7 +149,23 @@ async def retry_job(job_id: str) -> JobOut:
             detail=f"Only failed or cancelled jobs can be retried (this one is {job.status}).",
         )
 
-    await asyncio.to_thread(store.update_job, job_id, status="queued", error=None, progress=0.0)
+    try:
+        failed_stage = Stage(job.current_stage)
+    except ValueError:
+        failed_stage = Stage.PREPARE
+
+    # The filesystem marker carries retry-only state without changing either
+    # the database schema or the public response model.
+    await asyncio.to_thread(JobWorkspace(job_id).set_retry_stage, failed_stage)
+    completed_progress = sum(STAGE_WEIGHTS[stage] for stage in STAGES[: STAGES.index(failed_stage)])
+    await asyncio.to_thread(
+        store.update_job,
+        job_id,
+        status="queued",
+        error=None,
+        progress=completed_progress,
+        finished_at=None,
+    )
     queue.notify()
 
     updated = await asyncio.to_thread(store.get_job, job_id)

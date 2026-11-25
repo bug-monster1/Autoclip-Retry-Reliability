@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ from ..db import store
 from ..db.models import Clip, Export, Job, Source, new_id, utcnow
 from ..db.models import Transcript as TranscriptRow
 from ..providers import build_provider, detection_config
-from . import Stage, captions, export, ffmpeg, highlights, prepare, transcribe
+from . import STAGES, Stage, captions, export, ffmpeg, highlights, prepare, transcribe
 from .prepare import Silence
 from .reframe import ReframeConfig, build_crop_path
 from .reframe.croppath import CropPath
@@ -100,6 +101,25 @@ class JobWorkspace:
     def captions_dir(self) -> Path:
         return self.root / "captions"
 
+    @property
+    def retry_state(self) -> Path:
+        return self.root / "retry.json"
+
+    def set_retry_stage(self, stage: Stage) -> None:
+        """Persist retry intent without changing the database/API schema."""
+        temporary = self.retry_state.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"stage": stage.value}), encoding="utf-8")
+        temporary.replace(self.retry_state)
+
+    def get_retry_stage(self) -> Stage | None:
+        try:
+            return Stage(json.loads(self.retry_state.read_text(encoding="utf-8"))["stage"])
+        except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def clear_retry_stage(self) -> None:
+        self.retry_state.unlink(missing_ok=True)
+
 
 class PipelineRunner:
     """Executes one job."""
@@ -115,11 +135,27 @@ class PipelineRunner:
     ) -> None:
         self.job = job
         self.source = source
-        self.settings = settings or load_settings()
+        # Jobs snapshot their processing settings at creation time.  A retry
+        # must use that snapshot even if the user changed global preferences
+        # after the original attempt.
+        self.settings = settings or (
+            Settings.model_validate(job.settings) if job.settings else load_settings()
+        )
         self.on_progress = on_progress
         self._is_cancelled = is_cancelled or (lambda: False)
         self.workspace = JobWorkspace(job.id)
         self._completed_weight = 0.0
+        self._retry_from = self.workspace.get_retry_stage()
+        self._replace_candidates_on_success = False
+
+    def _regenerate(self, stage: Stage) -> bool:
+        """Whether *stage* is the failed stage or one of its dependants."""
+        return self._retry_from is not None and STAGES.index(stage) >= STAGES.index(
+            self._retry_from
+        )
+
+    def _before_retry_point(self, stage: Stage) -> bool:
+        return self._retry_from is not None and STAGES.index(stage) < STAGES.index(self._retry_from)
 
     # -- progress ----------------------------------------------------------
 
@@ -158,6 +194,8 @@ class PipelineRunner:
         stage reported 0 — visibly, at every stage boundary.
         """
         self._completed_weight += STAGE_WEIGHTS[stage]
+        if self._before_retry_point(stage):
+            return
         self._emit(stage, 1.0, overall=self._completed_weight)
 
     def _stage_progress(self, stage: Stage) -> Callable[[float], None]:
@@ -165,6 +203,11 @@ class PipelineRunner:
             self._emit(stage, max(0.0, min(1.0, fraction)))
 
         return report
+
+    def _begin_stage(self, stage: Stage) -> None:
+        """Record the stage before any cache read or setup can fail."""
+        if not self._before_retry_point(stage):
+            store.update_job(self.job.id, current_stage=stage.value)
 
     # -- entry point -------------------------------------------------------
 
@@ -175,6 +218,7 @@ class PipelineRunner:
         try:
             audio = self._stage_prepare()
             transcript = self._stage_transcribe(audio)
+            self._begin_stage(Stage.HIGHLIGHTS)
             silences = self._load_or_detect_silences(audio)
             clips = await self._stage_highlights(transcript, silences)
             crop_paths = self._stage_reframe(clips, transcript)
@@ -189,16 +233,26 @@ class PipelineRunner:
             raise
 
         store.update_job(self.job.id, status="done", progress=1.0, finished_at=utcnow())
+        self.workspace.clear_retry_stage()
         return clips
 
     # -- stages ------------------------------------------------------------
 
     def _stage_prepare(self) -> Path:
         stage = Stage.PREPARE
+        self._begin_stage(stage)
         self._check_cancelled()
         source_path = Path(self.source.path)
 
-        if self.workspace.audio.exists() and self.workspace.audio.stat().st_size > 0:
+        regenerate = self._regenerate(stage)
+        if regenerate:
+            self.workspace.audio.unlink(missing_ok=True)
+        reusable_audio = (
+            not regenerate
+            and self.workspace.audio.exists()
+            and self.workspace.audio.stat().st_size > 0
+        )
+        if reusable_audio:
             log.info("Reusing existing audio for job %s.", self.job.id)
         else:
             self._emit(stage, 0.0, "Extracting audio")
@@ -209,6 +263,8 @@ class PipelineRunner:
                 on_progress=self._stage_progress(stage),
             )
 
+        if regenerate and self.workspace.thumbnails.exists():
+            shutil.rmtree(self.workspace.thumbnails)
         if self.source.has_video and not self.workspace.thumbnails.exists():
             prepare.generate_thumbnails(source_path, self.workspace.thumbnails)
 
@@ -217,9 +273,10 @@ class PipelineRunner:
 
     def _stage_transcribe(self, audio: Path) -> Transcript:
         stage = Stage.TRANSCRIBE
+        self._begin_stage(stage)
         self._check_cancelled()
 
-        if self.workspace.transcript.exists():
+        if not self._regenerate(stage) and self.workspace.transcript.exists():
             log.info("Reusing existing transcript for job %s.", self.job.id)
             transcript = Transcript.load(self.workspace.transcript)
             self._finish_stage(stage)
@@ -257,7 +314,8 @@ class PipelineRunner:
         return transcript
 
     def _load_or_detect_silences(self, audio: Path) -> list[Silence]:
-        if self.workspace.silences.exists():
+        regenerate = self._regenerate(Stage.HIGHLIGHTS)
+        if not regenerate and self.workspace.silences.exists():
             raw = json.loads(self.workspace.silences.read_text(encoding="utf-8"))
             return [Silence(**item) for item in raw]
 
@@ -272,10 +330,12 @@ class PipelineRunner:
         self, transcript: Transcript, silences: list[Silence]
     ) -> list[Clip]:
         stage = Stage.HIGHLIGHTS
+        self._begin_stage(stage)
         self._check_cancelled()
 
         existing = store.list_clips(self.job.id)
-        if existing:
+        regenerate = self._regenerate(stage)
+        if existing and not regenerate:
             log.info("Reusing %d existing clips for job %s.", len(existing), self.job.id)
             self._finish_stage(stage)
             return existing
@@ -294,12 +354,18 @@ class PipelineRunner:
             on_progress=self._stage_progress(stage),
         )
 
-        store.replace_clips(self.job.id, clips)
+        # Keep candidates (and their successful exports) from the prior
+        # attempt visible until every downstream stage has completed.
+        if regenerate and existing:
+            self._replace_candidates_on_success = True
+        else:
+            store.replace_clips(self.job.id, clips)
         self._finish_stage(stage)
         return clips
 
     def _stage_reframe(self, clips: list[Clip], transcript: Transcript) -> dict[str, CropPath]:
         stage = Stage.REFRAME
+        self._begin_stage(stage)
         self._check_cancelled()
         source_path = Path(self.source.path)
 
@@ -321,7 +387,7 @@ class PipelineRunner:
         for index, clip in enumerate(clips):
             self._check_cancelled()
             cached = self.workspace.crop_path(clip.id)
-            if cached.exists():
+            if cached.exists() and not self._regenerate(stage):
                 crop_paths[clip.id] = CropPath.load(cached)
             else:
                 crop_paths[clip.id] = build_crop_path(
@@ -340,6 +406,7 @@ class PipelineRunner:
 
     def _stage_captions(self, clips: list[Clip], transcript: Transcript) -> None:
         stage = Stage.CAPTIONS
+        self._begin_stage(stage)
         self._check_cancelled()
         # Caption files are written during export, where the output dimensions
         # are known. This stage validates the style so a typo fails fast rather
@@ -354,22 +421,25 @@ class PipelineRunner:
         crop_paths: dict[str, CropPath],
     ) -> None:
         stage = Stage.EXPORT
+        self._begin_stage(stage)
         self._check_cancelled()
 
         style = captions.get_style(self.settings.export.caption_style)
         ratio = self.settings.export.ratio
         source_path = Path(self.source.path)
-        destination_dir = paths.exports_dir() / self.job.id
-        destination_dir.mkdir(parents=True, exist_ok=True)
+        attempt_id = new_id()
+        staging_dir = self.workspace.root / "pending-exports" / attempt_id
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        final_dir = paths.exports_dir() / self.job.id / attempt_id
+        records: list[Export] = []
 
         for index, clip in enumerate(clips):
             self._check_cancelled()
 
             crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(clip, ratio)
             words = transcript.slice(clip.start_word, clip.end_word)
-            destination = destination_dir / export.output_filename(
-                clip.title or f"clip-{clip.rank}", ratio
-            )
+            filename = export.output_filename(clip.title or f"clip-{clip.rank}", ratio)
+            destination = staging_dir / filename
 
             request = export.ExportRequest(
                 source=source_path,
@@ -393,17 +463,37 @@ class PipelineRunner:
                 cancelled=self._is_cancelled,
             )
 
-            store.create_export(
+            records.append(
                 Export(
                     id=new_id(),
                     clip_id=clip.id,
-                    path=str(destination),
+                    path=str(final_dir / filename),
                     ratio=ratio,
                     style=style.key,
                     size_bytes=destination.stat().st_size,
                 )
             )
-            store.update_clip(clip.id, status="exported")
+
+        # Publish files under a new path, then switch all database records in
+        # one transaction.  Until that transaction commits, every old download
+        # URL and file remains valid.
+        final_dir.parent.mkdir(parents=True, exist_ok=True)
+        staging_dir.replace(final_dir)
+        try:
+            old_paths = store.publish_pipeline_exports(
+                self.job.id,
+                clips,
+                records,
+                replace_candidates=self._replace_candidates_on_success,
+            )
+        except Exception:
+            shutil.rmtree(final_dir, ignore_errors=True)
+            raise
+
+        new_paths = {record.path for record in records}
+        for old_path in old_paths:
+            if old_path not in new_paths:
+                Path(old_path).unlink(missing_ok=True)
 
         self._finish_stage(stage)
 

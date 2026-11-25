@@ -233,13 +233,27 @@ class TestJobs:
         assert client.post(f"/api/jobs/{job.id}/cancel").status_code == 409
 
     def test_retry_requeues_a_failed_job(self, client: TestClient, source: Source) -> None:
-        job = store.create_job(Job(id=new_id(), source_id=source.id, status="failed", error="boom"))
+        job = store.create_job(
+            Job(
+                id=new_id(),
+                source_id=source.id,
+                status="failed",
+                current_stage="reframe",
+                error="boom",
+            )
+        )
 
         response = client.post(f"/api/jobs/{job.id}/retry")
 
         assert response.status_code == 200
         assert response.json()["status"] == "queued"
         assert response.json()["error"] is None
+        assert response.json()["progress"] == pytest.approx(0.55)
+
+        from autoclip.pipeline import Stage
+        from autoclip.pipeline.runner import JobWorkspace
+
+        assert JobWorkspace(job.id).get_retry_stage() is Stage.REFRAME
 
     def test_retrying_a_running_job_conflicts(self, client: TestClient, source: Source) -> None:
         job = store.create_job(Job(id=new_id(), source_id=source.id, status="running"))
