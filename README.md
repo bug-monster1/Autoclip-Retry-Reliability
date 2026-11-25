@@ -1,6 +1,19 @@
-# AutoClip
+# AutoClip 
 
-**Open-source, local-first AI video clipper.** Long video in → ranked, caption-burned, speaker-tracked 9:16 clips out.
+**An open-source, local-first AI video clipper with enhanced job retry reliability.**
+
+AutoClip transforms long videos into short, vertically formatted clips using AI-powered transcription, highlight detection, speaker tracking, and animated captions.
+
+### Engineering Contribution
+
+This repository includes improvements to the reliability of failed video-processing jobs:
+
+- Checkpoint-based pipeline resumption to avoid repeating completed stages.
+- Automatic regeneration of downstream artifacts to prevent stale outputs.
+- Preservation of previously successful outputs until a retry completes successfully.
+- Regression tests covering retry execution, checkpoint persistence, and output preservation.
+
+**Tech stack:** Python, FastAPI, React, TypeScript, SQLite, Pytest.
 
 [![CI](https://github.com/bug-monster1/Autoclip-Retry-Reliability/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-monster1/Autoclip-Retry-Reliability/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -11,6 +24,11 @@ Paste a YouTube link or drop a file. AutoClip transcribes it, uses an LLM to fin
 No accounts. No uploads to anyone's servers. No watermarks. No subscription.
 
 ---
+## Repository Focus
+
+This repository builds on the existing AutoClip application with a focused engineering contribution to improve failed-job retry reliability.
+
+The enhancement introduces checkpoint-based pipeline recovery, downstream artifact regeneration, and preservation of previously successful outputs during retry execution. It also includes backend, database, frontend, and regression-testing improvements.
 
 ## Why this exists
 
@@ -71,7 +89,7 @@ git clone https://github.com/bug-monster1/Autoclip-Retry-Reliability.git
 ```
 
 ```bash
-cd autoclip && uv venv --python 3.11 && uv pip install -e ".[dev]"
+cd Autoclip-Retry-Reliability && uv venv --python 3.11 && uv pip install -e ".[dev]"
 ```
 
 ```bash
@@ -182,45 +200,53 @@ Everything here is a real failure hit during development, not hypothetical.
 ingest → prepare → transcribe → highlights → reframe → captions → export
 ```
 
-Each stage writes artifacts to `~/.autoclip/work/{job_id}/`, so a retry resumes at the stage that failed rather than starting over. Two decisions carry most of the design:
-
-**Highlight detection returns word indices, not timestamps.** Models are unreliable at arithmetic and completely reliable at copying a number they can see. Timing is looked up from measured word timings afterwards.
-
-**Crop paths never interpolate across a cut.** Shots are detected first and framed independently. Panning through an edit is the most obvious sign of an auto-reframed video.
+Each stage writes artifacts to `~/.autoclip/work/{job_id}/`, enabling checkpoint-based recovery. When a stage fails, a retry resumes from the appropriate checkpoint, preserves valid upstream work, and regenerates dependent downstream artifacts to prevent stale outputs. The previous successful output remains available until the retry completes successfully.
 
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the rest, including why several odd-looking choices exist.
 
 ## Retry Reliability Enhancement
 
-This repository includes improvements to the reliability of failed video-processing job retries.
+This repository includes engineering improvements to the reliability and recovery of failed video-processing jobs.
 
 ### Problem
 
-Previously, retrying a failed job could repeat expensive processing stages and risk reusing outdated downstream artifacts. This made recovery inefficient and could leave inconsistent outputs.
+Retrying a failed job could unnecessarily repeat expensive processing stages and risk reusing outdated downstream artifacts. Additionally, a failed retry could affect the availability of a previously successful output.
 
-### Improvements
+### Key Improvements
 
-- **Checkpoint-based resumption:** A retry resumes from the stage where processing previously failed instead of unnecessarily repeating completed work.
-- **Downstream artifact regeneration:** When a stage is retried, its dependent downstream stages are regenerated to prevent stale artifacts from being reused.
-- **Output preservation:** The previous successful output remains available while a retry is in progress and is replaced only after the retry completes successfully.
-- **Database compatibility:** Implemented without introducing database migrations or changing the existing API response format.
-- **Frontend updates:** Improved job progress handling to support retry execution and status updates.
+- **Checkpoint-based resumption:** Failed jobs resume from the appropriate processing checkpoint instead of repeating completed stages unnecessarily.
+- **Downstream artifact regeneration:** Dependent downstream stages are regenerated during retries to prevent stale artifacts from being reused.
+- **Previous output preservation:** The last successful output remains available while a retry is running and is replaced only after the new execution succeeds.
+- **Database compatibility:** Implemented without database migrations or changes to the existing API response format.
+- **Frontend retry handling:** Updated job progress and status handling to support retry execution.
 
-### Testing
+### Implementation Areas
+
+- Backend retry API and job handling.
+- Database checkpoint and job-state persistence.
+- Pipeline execution and artifact lifecycle management.
+- Frontend job progress and status updates.
+- Automated retry regression tests.
+
+### Testing and Validation
 
 Added regression tests covering:
 
 - Checkpoint persistence and retrieval.
-- Failed-stage resumption and downstream stage regeneration.
+- Failed-stage resumption.
+- Downstream artifact regeneration.
 - Preservation of previously successful output when a retry fails.
 
-Validation results:
+**Validation results:**
 
-- Backend tests: 300 passed, 24 skipped.
-- Python linting: Ruff checks passed.
-- Frontend production build: successful.
+| Validation | Result |
+|---|---|
+| Backend test suite | 300 passed, 24 skipped |
+| Ruff lint checks | Passed |
+| Frontend production build | Passed |
+| Git diff whitespace checks | Passed |
 
-The 24 skipped tests require a separate end-to-end media fixture.
+The 24 skipped tests require the optional `AUTOCLIP_E2E_MEDIA` fixture.
 
 ## What has and hasn't been verified
 
