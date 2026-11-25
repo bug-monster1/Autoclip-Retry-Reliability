@@ -2,7 +2,7 @@
 
 **Open-source, local-first AI video clipper.** Long video in → ranked, caption-burned, speaker-tracked 9:16 clips out.
 
-[![CI](https://github.com/artbyjazi/autoclip/actions/workflows/ci.yml/badge.svg)](https://github.com/artbyjazi/autoclip/actions/workflows/ci.yml)
+[![CI](https://github.com/bug-monster1/Autoclip-Retry-Reliability/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-monster1/Autoclip-Retry-Reliability/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11 | 3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 
@@ -67,7 +67,7 @@ sudo apt install ffmpeg
 ## Quickstart
 
 ```bash
-git clone https://github.com/artbyjazi/autoclip.git
+git clone https://github.com/bug-monster1/Autoclip-Retry-Reliability.git
 ```
 
 ```bash
@@ -189,6 +189,38 @@ Each stage writes artifacts to `~/.autoclip/work/{job_id}/`, so a retry resumes 
 **Crop paths never interpolate across a cut.** Shots are detected first and framed independently. Panning through an edit is the most obvious sign of an auto-reframed video.
 
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the rest, including why several odd-looking choices exist.
+
+## Retry Reliability Enhancement
+
+This repository includes improvements to the reliability of failed video-processing job retries.
+
+### Problem
+
+Previously, retrying a failed job could repeat expensive processing stages and risk reusing outdated downstream artifacts. This made recovery inefficient and could leave inconsistent outputs.
+
+### Improvements
+
+- **Checkpoint-based resumption:** A retry resumes from the stage where processing previously failed instead of unnecessarily repeating completed work.
+- **Downstream artifact regeneration:** When a stage is retried, its dependent downstream stages are regenerated to prevent stale artifacts from being reused.
+- **Output preservation:** The previous successful output remains available while a retry is in progress and is replaced only after the retry completes successfully.
+- **Database compatibility:** Implemented without introducing database migrations or changing the existing API response format.
+- **Frontend updates:** Improved job progress handling to support retry execution and status updates.
+
+### Testing
+
+Added regression tests covering:
+
+- Checkpoint persistence and retrieval.
+- Failed-stage resumption and downstream stage regeneration.
+- Preservation of previously successful output when a retry fails.
+
+Validation results:
+
+- Backend tests: 300 passed, 24 skipped.
+- Python linting: Ruff checks passed.
+- Frontend production build: successful.
+
+The 24 skipped tests require a separate end-to-end media fixture.
 
 ## What has and hasn't been verified
 
